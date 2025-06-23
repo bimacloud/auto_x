@@ -1,0 +1,176 @@
+import requests
+import webbrowser
+from urllib.parse import parse_qs, urlparse
+from requests.auth import HTTPBasicAuth
+import json
+from bs4 import BeautifulSoup
+import time
+import random
+import os
+
+client_id = 'cXhHcFRYOGMwNkNYZG9hYzBkQjM6MTpjaQ'
+client_secret = 'si3YVfU6fqYEnHNIehBxmtSlxHFDu7G2sc_k9nR6__D33Ls0wW'
+redirect_uri = 'http://localhost:5000/callback'
+token_file = 'token.json'
+
+def save_tokens(tokens):
+    with open(token_file, 'w') as f:
+        json.dump(tokens, f)
+
+def load_tokens():
+    if os.path.exists(token_file):
+        with open(token_file, 'r') as f:
+            return json.load(f)
+    return None
+
+def get_new_tokens():
+    authorize_url = (
+        "https://twitter.com/i/oauth2/authorize"
+        "?response_type=code"
+        f"&client_id={client_id}"
+        f"&redirect_uri={redirect_uri}"
+        "&scope=tweet.read%20tweet.write%20users.read%20offline.access"
+        "&state=randomstate123"
+        "&code_challenge=challenge"
+        "&code_challenge_method=plain"
+    )
+
+    print("\n🔗 Buka URL ini di browser untuk login dan otorisasi akun Twitter kamu:")
+    webbrowser.open(authorize_url)
+
+    redirect_response = input("\n📥 Paste URL yang kamu dapat setelah login: ")
+    code = parse_qs(urlparse(redirect_response).query).get("code", [None])[0]
+
+    if not code:
+        print("❌ Gagal mengambil kode dari URL.")
+        exit()
+
+    token_url = "https://api.twitter.com/2/oauth2/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "code": code,
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_verifier": "challenge"
+    }
+
+    response = requests.post(token_url, headers=headers, data=data, auth=HTTPBasicAuth(client_id, client_secret))
+    if response.status_code != 200:
+        print("❌ Gagal tukar kode:")
+        print("Status:", response.status_code)
+        print("Response:", response.text)
+        exit()
+
+    tokens = response.json()
+    save_tokens(tokens)
+    return tokens
+
+def refresh_access_token(refresh_token):
+    print("🔄 Refreshing access token...")
+    token_url = "https://api.twitter.com/2/oauth2/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+        "client_id": client_id
+    }
+
+    response = requests.post(token_url, headers=headers, data=data, auth=HTTPBasicAuth(client_id, client_secret))
+    if response.status_code != 200:
+        print("❌ Gagal refresh token.")
+        print(response.status_code, response.text)
+        return None
+
+    tokens = response.json()
+    save_tokens(tokens)
+    return tokens
+
+# 🔐 Ambil token dari file atau login baru
+tokens = load_tokens()
+if not tokens or 'access_token' not in tokens:
+    tokens = get_new_tokens()
+
+access_token = tokens['access_token']
+
+# Coba tweet dummy untuk cek apakah token valid
+def is_token_valid(token):
+    test_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    resp = requests.get("https://api.twitter.com/2/users/me", headers=test_headers)
+    return resp.status_code == 200
+
+if not is_token_valid(access_token):
+    if 'refresh_token' in tokens:
+        tokens = refresh_access_token(tokens['refresh_token'])
+        if not tokens:
+            print("❌ Gagal refresh. Coba login ulang.")
+            tokens = get_new_tokens()
+        access_token = tokens['access_token']
+    else:
+        print("❌ Tidak ada refresh token. Login ulang...")
+        tokens = get_new_tokens()
+        access_token = tokens['access_token']
+
+# 🔧 Setup untuk kirim tweet
+tweet_url = "https://api.twitter.com/2/tweets"
+tweet_headers = {
+    "Authorization": f"Bearer {access_token}",
+    "Content-Type": "application/json"
+}
+
+# Load semua link
+with open("list_detail_links.txt", "r") as file:
+    all_links = [line.strip() for line in file if line.strip()]
+
+# Load posted link
+posted_links = set()
+if os.path.exists("posted.txt"):
+    with open("posted.txt", "r") as file:
+        posted_links = set(line.strip() for line in file if line.strip())
+
+# Filter link yang belum diposting
+links_to_post = [link for link in all_links if link not in posted_links]
+
+for i, link in enumerate(links_to_post):
+    try:
+        print(f"\n🔍 Ambil metadata dari: {link}")
+        page = requests.get(link, timeout=10)
+        soup = BeautifulSoup(page.text, 'html.parser')
+
+        title = soup.find("meta", property="og:title") or soup.find("title")
+        description = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+
+        title_text = title['content'] if title and title.has_attr('content') else (title.text if title else 'Tanpa judul')
+        description_text = description['content'] if description and description.has_attr('content') else ''
+
+        tweet_text = f"{title_text}\n{description_text}\n{link}"
+        if len(tweet_text) > 280:
+            tweet_text = tweet_text[:277] + "..."
+
+        payload = {"text": tweet_text}
+        tweet_response = requests.post(tweet_url, headers=tweet_headers, data=json.dumps(payload))
+
+        if tweet_response.status_code == 201:
+            print(f"✅ Berhasil tweet: {link}")
+            with open("posted.txt", "a") as posted_file:
+                posted_file.write(link + "\n")
+        else:
+            print(f"❌ Gagal tweet {link}")
+            print("Status:", tweet_response.status_code)
+            print("Response:", tweet_response.text)
+
+    except Exception as e:
+        print(f"\n⚠️ Error saat memproses: {link}")
+        print("Error:", e)
+
+    if i < len(links_to_post) - 1:
+        if i == 0:
+            delay = 15 * 60
+            print("⏳ Delay 15 menit setelah tweet pertama...")
+        else:
+            delay = random.randint(11, 25) * 60
+            print(f"⏳ Delay random {delay // 60} menit sebelum tweet berikutnya...")
+        time.sleep(delay)
